@@ -34,6 +34,36 @@ Three sub-agents handle specific tasks. Claude will dispatch them automatically 
 | `uploader` | Detect framework, move content to the correct `doc/<framework>/` location |
 | `prepare` | Scan all notes, show a full snapshot with one-line summaries per file |
 
+## Automation
+
+### 事件驅動 Hooks（本機）
+
+寫入 `.md` / `.ipynb` 檔案時自動觸發通知，提示應執行哪個 agent：
+
+| 觸發時機 | 通知內容 |
+|---------|---------|
+| 新筆記寫入 `doc/` 內 | 建議執行 `content-reviewer` 和 `prepare` |
+| 新筆記寫入 `doc/` 外 | 建議執行 `uploader` 搬到正確位置 |
+| 每次開啟專案（首次對話）| 建議執行 `prepare` 查看總覽 |
+
+設定檔：`.claude/settings.json`
+
+---
+
+### 定期排程（雲端）
+
+| 項目 | 內容 |
+|------|------|
+| 排程 ID | `trig_01FxDYQQ1yM7yqFUPWumSykh` |
+| 執行時間 | 每週一 09:00（台北時間） |
+| 執行內容 | `prepare` agent 掃描所有筆記，產出 `weekly-summary.md` |
+| 來源 repo | `github.com/jjwang1118/ML-Learnig` |
+| 管理頁面 | https://claude.ai/code/scheduled/trig_01FxDYQQ1yM7yqFUPWumSykh |
+
+> **注意**：每次新增或修改筆記後執行 `git push`，確保排程 agent 能讀到最新內容。
+
+---
+
 ## Conventions
 
 - Notes are written in Markdown (`.md`) or Jupyter Notebook (`.ipynb`)
