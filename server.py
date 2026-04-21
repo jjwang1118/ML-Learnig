@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Notes server — file tree, content, images, AI chat, and SSE file-watch."""
 
+import datetime
 import json
 import os
 import queue
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,9 +52,61 @@ def _broadcast(event_type: str, data: dict):
             _subscribers.remove(q)
 
 
+# ── Auto git push ──
+_push_timer: threading.Timer | None = None
+_push_lock  = threading.Lock()
+_pending_files: set[str] = set()
+
+def _do_push():
+    with _push_lock:
+        files = list(_pending_files)
+        _pending_files.clear()
+    if not files:
+        return
+    ts    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_path = ROOT / "push-log.md"
+    with open(log_path, "a", encoding="utf-8") as f:
+        for fp in files:
+            f.write(f"| {ts} | {Path(fp).name} | auto push |\n")
+    add_targets = files + [str(log_path)]
+    subprocess.run(["git", "-C", str(ROOT), "add"] + add_targets, capture_output=True)
+    names = ", ".join(Path(f).name for f in files)
+    r = subprocess.run(
+        ["git", "-C", str(ROOT), "commit", "-m", f"auto: update {names}"],
+        capture_output=True, text=True,
+    )
+    if "nothing to commit" in r.stdout + r.stderr:
+        return
+    r2 = subprocess.run(["git", "-C", str(ROOT), "push"], capture_output=True, text=True)
+    status = "成功" if r2.returncode == 0 else f"失敗：{r2.stderr.strip()}"
+    print(f"  [auto-push] {names} → {status}")
+
+def _schedule_push(filepath: str):
+    global _push_timer
+    with _push_lock:
+        _pending_files.add(filepath)
+    if _push_timer is not None:
+        _push_timer.cancel()
+    _push_timer = threading.Timer(3.0, _do_push)
+    _push_timer.daemon = True
+    _push_timer.start()
+
+
 # ── Watchdog ──
 class DocWatcher(FileSystemEventHandler):
-    def _notify(self, event):
+    def _handle(self, event):
+        if event.is_directory:
+            return
+        p = Path(event.src_path)
+        if p.suffix not in (".md", ".ipynb"):
+            return
+        _broadcast("tree-changed", {"path": str(p.relative_to(ROOT))})
+        _schedule_push(str(p))
+
+    on_created  = _handle
+    on_modified = _handle
+
+    def _notify_only(self, event):
         if event.is_directory:
             return
         p = Path(event.src_path)
@@ -60,10 +114,8 @@ class DocWatcher(FileSystemEventHandler):
             return
         _broadcast("tree-changed", {"path": str(p.relative_to(ROOT))})
 
-    on_created  = _notify
-    on_deleted  = _notify
-    on_moved    = _notify
-    on_modified = _notify
+    on_deleted = _notify_only
+    on_moved   = _notify_only
 
 
 def build_tree(base: Path) -> list:
