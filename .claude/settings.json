@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport json, sys, os\ntry:\n    data = json.load(sys.stdin)\n    fp = data.get('file_path', '')\n    ext = os.path.splitext(fp)[1]\n    in_doc = '/doc/' in fp\n    if ext in ('.md', '.ipynb') and in_doc:\n        print(f'\\n[auto] 新筆記寫入：{os.path.basename(fp)}')\n        print('  → 建議執行 content-reviewer 整理內容')\n        print('  → 建議執行 prepare 更新筆記總覽')\n    elif ext in ('.md', '.ipynb'):\n        print(f'\\n[auto] 筆記檔案 {os.path.basename(fp)} 寫入於 doc/ 以外')\n        print('  → 建議執行 uploader 搬到正確位置')\nexcept:\n    pass\n\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport os, sys\nflag = '/tmp/.notes_session_started'\nif not os.path.exists(flag):\n    open(flag, 'w').close()\n    print('[auto] 專案已開啟 → 建議執行 prepare 查看筆記總覽')\n\""
+          }
+        ]
+      }
+    ]
+  }
+}
