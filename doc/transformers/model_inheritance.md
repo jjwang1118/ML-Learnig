@@ -95,6 +95,7 @@ class BertForCustomTask(BertPreTrainedModel):
         self.bert = BertModel(config, add_pooling_layer=True)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        # 匯價
         self.post_init()
 
     def forward(
