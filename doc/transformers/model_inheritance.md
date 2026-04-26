@@ -4,9 +4,13 @@
 1. [為什麼需要繼承模型](#為什麼需要繼承模型)
 2. [繼承 PreTrainedModel（最底層基底）](#繼承-pretrainedmodel最底層基底)
 3. [繼承具體模型（加自訂 Head）](#繼承具體模型加自訂-head)
-4. [覆寫 forward() 的注意事項](#覆寫-forward-的注意事項)
-5. [呼叫差異對照](#呼叫差異對照)
-6. [常見錯誤與排查](#常見錯誤與排查)
+4. [其他常用 PreTrainedModel 子類](#其他常用-pretrainedmodel-子類)
+   - [CausalLM（GPT2 / LLaMA）](#causallmgpt2--llama)
+   - [MaskedLM（BERT / RoBERTa）](#maskedlmbert--roberta)
+   - [Seq2SeqLM（T5 / BART）](#seq2seqlmt5--bart)
+5. [覆寫 forward() 的注意事項](#覆寫-forward-的注意事項)
+6. [呼叫差異對照](#呼叫差異對照)
+7. [常見錯誤與排查](#常見錯誤與排查)
 
 ---
 
@@ -125,6 +129,194 @@ model = BertForCustomTask.from_pretrained(
     ignore_mismatched_sizes=True,  # classifier 形狀不同時不報錯
 )
 ```
+
+---
+
+## 其他常用 PreTrainedModel 子類
+
+Hugging Face 依任務類型提供多種 `PreTrainedModel` 子類，繼承對應的子類可直接獲得該任務的預設行為。
+
+### CausalLM（GPT2 / LLaMA）
+
+CausalLM 是自回歸語言模型（Autoregressive LM），適合文字生成、chat 等任務。  
+繼承 `GPT2PreTrainedModel` 或 `LlamaPreTrainedModel`，並自訂 language modeling head。
+
+```python
+import torch
+import torch.nn as nn
+from transformers import GPT2Model, GPT2PreTrainedModel, GPT2Config
+from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+
+class GPT2ForCustomCausalLM(GPT2PreTrainedModel):
+    """
+    繼承 GPT2PreTrainedModel，加上自訂 lm_head。
+    原本 GPT2LMHeadModel 也是這樣實作的。
+    """
+    def __init__(self, config):
+        super().__init__(config)
+        self.transformer = GPT2Model(config)           # backbone（只輸出 hidden states）
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        **kwargs,
+    ):
+        outputs = self.transformer(
+            input_ids,
+            attention_mask=attention_mask,
+        )
+        hidden_states = outputs.last_hidden_state       # [batch, seq_len, n_embd]
+        logits = self.lm_head(hidden_states)            # [batch, seq_len, vocab_size]
+
+        loss = None
+        if labels is not None:
+            # CausalLM：將 logits 左移一格對齊 labels
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)),
+                                         shift_labels.view(-1))
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+        )
+```
+
+**載入 GPT2 backbone 預訓練權重：**
+
+```python
+config = GPT2Config.from_pretrained("gpt2")
+model = GPT2ForCustomCausalLM(config)
+
+# 方式一：只載入 transformer backbone
+model.transformer = GPT2Model.from_pretrained("gpt2")
+
+# 方式二：整包 from_pretrained（lm_head 不匹配時用 ignore_mismatched_sizes）
+model = GPT2ForCustomCausalLM.from_pretrained("gpt2", ignore_mismatched_sizes=True)
+```
+
+**生成文字（CausalLM 特有）：**
+
+```python
+# CausalLM 繼承後自動獲得 .generate() 方法
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+inputs = tokenizer("Hello, my name is", return_tensors="pt")
+
+generated = model.generate(**inputs, max_new_tokens=20, do_sample=True)
+print(tokenizer.decode(generated[0]))
+```
+
+> **與 BertPreTrainedModel 的關鍵差異**：CausalLM 使用因果注意力遮罩（causal mask），  
+> 每個 token 只能看到左側的 token；BERT 則是雙向注意力。
+
+---
+
+### MaskedLM（BERT / RoBERTa）
+
+MaskedLM 用於填充遮蓋詞（`[MASK]`），適合 fine-tune 預訓練、語言理解任務。
+
+```python
+from transformers import BertModel, BertPreTrainedModel, BertConfig
+from transformers.modeling_outputs import MaskedLMOutput
+
+class BertForCustomMaskedLM(BertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.bert = BertModel(config, add_pooling_layer=False)  # MLM 不需要 pooler
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
+        self.post_init()
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = self.bert(input_ids, attention_mask=attention_mask)
+        sequence_output = outputs.last_hidden_state          # [batch, seq_len, hidden]
+        logits = self.lm_head(sequence_output)               # [batch, seq_len, vocab]
+
+        loss = None
+        if labels is not None:
+            # labels 中 -100 的位置會被 CrossEntropyLoss 忽略（非 MASK 位置）
+            loss = nn.CrossEntropyLoss()(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+        return MaskedLMOutput(loss=loss, logits=logits)
+```
+
+---
+
+### Seq2SeqLM（T5 / BART）
+
+Seq2SeqLM 有 encoder 和 decoder，適合翻譯、摘要、問答生成。
+
+```python
+from transformers import T5ForConditionalGeneration, T5PreTrainedModel, T5Config
+from transformers.modeling_outputs import Seq2SeqLMOutput
+
+class T5ForCustomSeq2Seq(T5PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        # T5 的 encoder-decoder 包在 T5Model 裡
+        from transformers import T5Model
+        self.model = T5Model(config)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        decoder_input_ids=None,   # Seq2Seq 需要明確傳入 decoder 的輸入
+        labels=None,
+        **kwargs,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+        )
+        sequence_output = outputs.last_hidden_state
+        logits = self.lm_head(sequence_output)
+
+        loss = None
+        if labels is not None:
+            loss = nn.CrossEntropyLoss(ignore_index=-100)(
+                logits.view(-1, logits.size(-1)), labels.view(-1)
+            )
+
+        return Seq2SeqLMOutput(loss=loss, logits=logits)
+```
+
+**Seq2SeqLM 呼叫時需多傳 `decoder_input_ids`：**
+
+```python
+model = T5ForCustomSeq2Seq.from_pretrained("t5-small", ignore_mismatched_sizes=True)
+tokenizer = AutoTokenizer.from_pretrained("t5-small")
+
+src = tokenizer("translate English to French: Hello", return_tensors="pt")
+tgt = tokenizer("Bonjour", return_tensors="pt")
+
+outputs = model(
+    input_ids=src["input_ids"],
+    attention_mask=src["attention_mask"],
+    decoder_input_ids=tgt["input_ids"],
+    labels=tgt["input_ids"],
+)
+print(outputs.loss)
+```
+
+---
+
+### 三種子類快速對照
+
+| | `BertPreTrainedModel` | `GPT2PreTrainedModel` | `T5PreTrainedModel` |
+|---|---|---|---|
+| 注意力方向 | 雙向（Masked Self-Attention） | 單向（Causal） | Encoder 雙向 / Decoder 單向 |
+| 常見任務 | 分類、NER、MLM | 生成、Chat | 翻譯、摘要 |
+| decoder_input_ids | 不需要 | 不需要 | **需要** |
+| `.generate()` 支援 | ❌ | ✅ | ✅ |
+| labels 對齊方式 | 直接對齊 | **左移一格** | 直接對齊 |
 
 ---
 
